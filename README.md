@@ -5,6 +5,6 @@ This project is a modernization of the **OPTIMAL-IPB** framework (Pribadi et al.
 
 ## Current Status
 - [x] Project Initialization
-- [ ] Plugin Scaffolding (Plugin Builder)
-- [ ] YOLOv8 Model Integration
+- [x] Plugin Scaffolding (Plugin Builder)
+- [x] YOLOv8 Model Integration
 - [ ] Spatial Analytics Suite

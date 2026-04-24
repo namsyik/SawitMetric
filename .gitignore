@@ -205,3 +205,15 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# QGIS Plugin Specifics
+ui_*.py
+resources_rc.py
+
+# Ignore local QGIS environment settings
+.qgis2/
+.qgis3/
+
+# Documentation and temporary build files
+*.zip
+gen_help/

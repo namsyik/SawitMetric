@@ -11,15 +11,6 @@
         copyright            : (C) 2026 by Kenzie Farrel
         email                : kenziefarrel81@gmail.com
  ***************************************************************************/
-
-/***************************************************************************
- *                                                                         *
- *   This program is free software; you can redistribute it and/or modify  *
- *   it under the terms of the GNU General Public License as published by  *
- *   the Free Software Foundation; either version 2 of the License, or     *
- *   (at your option) any later version.                                   *
- *                                                                         *
- ***************************************************************************/
 """
 
 __author__ = 'Kenzie Farrel'
@@ -32,7 +23,7 @@ __revision__ = '$Format:%H$'
 
 import numpy as np
 from ultralytics import YOLO
-from qgis.core import (QgsFeature, QgsGeometry, QgsPointXY, QgsFields, QgsField)
+from qgis.core import (QgsFeature, QgsGeometry, QgsPointXY, QgsFields, QgsField, QgsCoordinateReferenceSystem)
 from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (QgsProcessing,
@@ -49,22 +40,6 @@ from qgis.core import (QgsProcessing,
 
 
 class SawitMetricAlgorithm(QgsProcessingAlgorithm):
-    """
-    This is an example algorithm that takes a vector layer and
-    creates a new identical one.
-
-    It is meant to be used as an example of how to create your own
-    algorithms and explain methods and variables used to do it. An
-    algorithm like this will be available in all elements, and there
-    is not need for additional work.
-
-    All Processing algorithms should extend the QgsProcessingAlgorithm
-    class.
-    """
-
-    # Constants used to refer to parameters and outputs. They will be
-    # used when calling the algorithm from another algorithm, or when
-    # calling from the QGIS console.
 
     OUTPUT = 'OUTPUT'
     INPUT = 'INPUT'
@@ -126,10 +101,15 @@ class SawitMetricAlgorithm(QgsProcessingAlgorithm):
         
         model = YOLO(model_path)
         
+        # --- ADJUSTMENT: Set Target CRS to UTM (EPSG:32647) ---
+        target_crs = QgsCoordinateReferenceSystem("EPSG:32647")
+        
         fields = QgsFields()
         fields.append(QgsField("Confidence", QVariant.Double))
+        
+        # Ensure sink uses the UTM CRS
         (sink, dest_id) = self.parameterAsSink(parameters, self.OUTPUT,
-                context, fields, QgsWkbTypes.Point, raster_layer.crs())
+                context, fields, QgsWkbTypes.Point, target_crs)
 
         provider = raster_layer.dataProvider()
         rows = raster_layer.height()
@@ -179,20 +159,15 @@ class SawitMetricAlgorithm(QgsProcessingAlgorithm):
                             'conf': float(box.conf[0])
                         })
 
-        # --- REFINED NMS PASS (Degrees to Meters) ---
-        feedback.pushInfo(f"Filtering {len(all_detections)} detections for EPSG:4326...")
+        # --- ADJUSTMENT: Optimized NMS for UTM (Meters) ---
+        feedback.pushInfo(f"Filtering {len(all_detections)} detections in UTM Meters...")
         all_detections.sort(key=lambda x: x['conf'], reverse=True)
-        
-        # Initialize the distance tool
-        d = QgsDistanceArea()
-        d.setSourceCrs(raster_layer.crs(), context.transformContext())
-        d.setEllipsoid(context.ellipsoid()) # Use project ellipsoid (usually WGS84)
         
         spatial_index = QgsSpatialIndex()
         final_points = []
         
-        # Approximate degree window to limit search (0.0001 deg is ~11m)
-        search_window = 0.0001 
+        # Search window is now in meters. 10m is a safe radius for palm spacing.
+        search_window = 10.0
 
         for i, det in enumerate(all_detections):
             search_rect = QgsRectangle(
@@ -200,14 +175,13 @@ class SawitMetricAlgorithm(QgsProcessingAlgorithm):
                 det['point'].x() + search_window, det['point'].y() + search_window
             )
             
-            # Find nearby candidates
             potential_neighbor_ids = spatial_index.intersects(search_rect)
             
             keep = True
             for n_idx in potential_neighbor_ids:
-                # Calculate ACTUAL distance in meters
                 neighbor_pt = all_detections[n_idx]['point']
-                dist_m = d.measureLine(det['point'], neighbor_pt)
+                # Direct distance calculation (accurate in UTM)
+                dist_m = det['point'].distance(neighbor_pt)
                 
                 if dist_m < min_dist:
                     keep = False
@@ -231,37 +205,15 @@ class SawitMetricAlgorithm(QgsProcessingAlgorithm):
         return {self.OUTPUT: dest_id}
     
     def name(self):
-        """
-        Returns the algorithm name, used for identifying the algorithm. This
-        string should be fixed for the algorithm, and must not be localised.
-        The name should be unique within each provider. Names should contain
-        lowercase alphanumeric characters only and no spaces or other
-        formatting characters.
-        """
         return 'Detect and Count Palm Trees'
 
     def displayName(self):
-        """
-        Returns the translated algorithm name, which should be used for any
-        user-visible display of the algorithm name.
-        """
         return self.tr(self.name())
 
     def group(self):
-        """
-        Returns the name of the group this algorithm belongs to. This string
-        should be localised.
-        """
         return self.tr(self.groupId())
 
     def groupId(self):
-        """
-        Returns the unique ID of the group this algorithm belongs to. This
-        string should be fixed for the algorithm, and must not be localised.
-        The group id should be unique within each provider. Group id should
-        contain lowercase alphanumeric characters only and no spaces or other
-        formatting characters.
-        """
         return 'Inventory Tools'
 
     def tr(self, string):

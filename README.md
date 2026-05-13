@@ -1,10 +1,19 @@
-# SawitMetric
-A QGIS 3.40 plugin for automated oil palm tree detection and counting using YOLOv8. 
+# SawitMetric QGIS Plugin
 
-This project is a modernization of the **OPTIMAL-IPB** framework (Pribadi et al., 2023).
+Deep Learning-based Oil Palm Detection & Counting for sustainable rural development. 
+This project implements the **OPTIMAL-IPB** approach for precision spatial information systems.
 
-## Current Status
-- [x] Project Initialization
-- [x] Plugin Scaffolding (Plugin Builder)
-- [x] YOLOv8 Model Integration
-- [ ] Spatial Analytics Suite
+## 🚀 Objectives
+- **Precise Detection:** Using YOLOv8 to identify palm crowns in high-res imagery.
+- **Contrast Adaptation:** Integrated CLAHE preprocessing to handle varied satellite imagery.
+- **Scientific Metrics:** Estimating palm age and yield based on Canopy Projection Area (CPA).
+- **RTRW Alignment:** Outputting UTM (EPSG:32647) geometries for spatial plan compliance.
+
+## 🛠️ Installation & Setup
+
+### 1. Prerequisites
+- **QGIS 3.40**
+- **Python 3.12**
+- **Dependencies:**
+  ```bash
+  pip install ultralytics opencv-python numpy

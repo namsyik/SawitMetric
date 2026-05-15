@@ -26,10 +26,9 @@ __author__ = 'Kenzie Farrel'
 __date__ = '2026-04-22'
 __copyright__ = '(C) 2026 by Kenzie Farrel'
 
-# This will get replaced with a git SHA1 when you do a git archive
-
 __revision__ = '$Format:%H$'
 
+import os
 import math
 import numpy as np
 import torch
@@ -49,6 +48,7 @@ from qgis.core import (
     QgsProcessingParameterFile,
     QgsProcessingParameterNumber,
     QgsProcessingParameterRasterLayer,
+    QgsProcessingParameterEnum,
     QgsRectangle,
     QgsSpatialIndex,
     QgsDistanceArea,
@@ -79,6 +79,15 @@ class SawitMetricAlgorithm(QgsProcessingAlgorithm):
     INPUT = 'INPUT'
 
     def initAlgorithm(self, config=None):
+        plugin_dir = os.path.dirname(__file__)
+        self.models_dir = os.path.join(plugin_dir, 'models')
+        
+        if not os.path.exists(self.models_dir):
+            os.makedirs(self.models_dir)
+
+        self.model_files = [f for f in os.listdir(self.models_dir) if f.endswith('.pt')]
+
+        # --- PARAMETERS ---
         # Input Satellite/Drone Imagery (.tif)
         self.addParameter(
             QgsProcessingParameterRasterLayer(
@@ -88,22 +97,44 @@ class SawitMetricAlgorithm(QgsProcessingAlgorithm):
         )
  
         # YOLOv8 Weights (.pt)
+        if not self.model_files:
+            # If no models found, show a dummy dropdown to notify the user
+            self.addParameter(
+                QgsProcessingParameterEnum(
+                    'MODEL_SELECT',
+                    self.tr('ERROR: No .pt models found in plugin/models folder!'),
+                    options=['Please add a model and restart QGIS'],
+                    defaultValue=0
+                )
+            )
+        else:
+            self.addParameter(
+                QgsProcessingParameterEnum(
+                    'MODEL_SELECT',
+                    self.tr('Select Internal YOLOv8 Model'),
+                    options=self.model_files,
+                    defaultValue=0
+                )
+            )
+
+        # Keep the manual file picker as an "Override" option 
         self.addParameter(
             QgsProcessingParameterFile(
                 'MODEL_PATH',
-                self.tr('YOLOv8 Model File (.pt)'),
-                extension='pt'
+                self.tr('OR Select External Model File (.pt)'),
+                extension='pt',
+                optional=True
             )
         )
  
-        # Detection confidence — intentionally low to collect all candidates.
+        # Detection confidence — intentionally low to collect all candidates (will slow down when running NMS).
         # Use Display Confidence below to filter what appears in the output.
         self.addParameter(
             QgsProcessingParameterNumber(
                 'CONFIDENCE',
                 self.tr('Detection Confidence Threshold (lower = more candidates)'),
                 type=QgsProcessingParameterNumber.Double,
-                defaultValue=0.1,
+                defaultValue=0.4,
                 minValue=0.0,
                 maxValue=1.0
             )
@@ -127,7 +158,7 @@ class SawitMetricAlgorithm(QgsProcessingAlgorithm):
                 'MIN_DIST',
                 self.tr('Minimum Distance Between Trees (meters)'),
                 type=QgsProcessingParameterNumber.Double,
-                defaultValue=3.0,
+                defaultValue=5.0,
                 minValue=0.0
             )
         )
@@ -153,7 +184,8 @@ class SawitMetricAlgorithm(QgsProcessingAlgorithm):
     def processAlgorithm(self, parameters, context, feedback):
         # --- RETRIEVE PARAMETERS ---
         raster_layer   = self.parameterAsRasterLayer(parameters, self.INPUT, context)
-        model_path     = self.parameterAsFile(parameters, 'MODEL_PATH', context)
+        manual_path = self.parameterAsFile(parameters, 'MODEL_PATH', context)
+        model_index = self.parameterAsInt(parameters, 'MODEL_SELECT', context)
         conf_threshold = self.parameterAsDouble(parameters, 'CONFIDENCE', context)
         display_conf   = self.parameterAsDouble(parameters, 'DISPLAY_CONF', context)
         min_dist       = self.parameterAsDouble(parameters, 'MIN_DIST', context)
@@ -201,11 +233,26 @@ class SawitMetricAlgorithm(QgsProcessingAlgorithm):
                 f"GSD is ~{gsd_meters:.2f} m/px. Detection quality may be reduced. "
                 f"Recommended: ≤ 0.5 m/px for oil palm."
             )
- 
+
+        # Priority: Manual File Picker > Internal Dropdown
+        if manual_path:
+            model_path = manual_path
+        elif self.model_files:
+            model_path = os.path.join(self.models_dir, self.model_files[model_index])
+        else:
+            # Final notification if the user tries to run without any models
+            feedback.reportError(
+                "CRITICAL: No detection models available. "
+                "Please place your YOLOv8 .pt files in the 'models' folder inside the plugin directory."
+            )
+            return {}
+
         # --- HARDWARE INITIALIZATION ---
         device   = 'cuda' if torch.cuda.is_available() else 'cpu'
         use_half = device == 'cuda'
         feedback.pushInfo(f"Running inference on: {device.upper()}")
+        
+        # Load the chosen model 
         model = YOLO(model_path).to(device)
  
         # --- OUTPUT LAYER SETUP ---
@@ -349,7 +396,9 @@ class SawitMetricAlgorithm(QgsProcessingAlgorithm):
             sink.addFeature(feat, QgsFeatureSink.FastInsert)
  
         feedback.setProgress(100)
+        
         return {self.OUTPUT: dest_id}
+    
 
     
     def name(self):

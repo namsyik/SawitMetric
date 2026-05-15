@@ -11,6 +11,15 @@
         copyright            : (C) 2026 by Kenzie Farrel
         email                : kenziefarrel81@gmail.com
  ***************************************************************************/
+
+/***************************************************************************
+ *                                                                         *
+ *   This program is free software; you can redistribute it and/or modify  *
+ *   it under the terms of the GNU General Public License as published by  *
+ *   the Free Software Foundation; either version 2 of the License, or     *
+ *   (at your option) any later version.                                   *
+ *                                                                         *
+ ***************************************************************************/
 """
 
 __author__ = 'Kenzie Farrel'
@@ -21,25 +30,50 @@ __copyright__ = '(C) 2026 by Kenzie Farrel'
 
 __revision__ = '$Format:%H$'
 
+import math
 import numpy as np
+import torch
+from osgeo import gdal
 from ultralytics import YOLO
-from qgis.core import (QgsFeature, QgsGeometry, QgsPointXY, QgsFields, QgsField, QgsCoordinateReferenceSystem)
-from qgis.PyQt.QtCore import QVariant
-from qgis.PyQt.QtCore import QCoreApplication
-from qgis.core import (QgsProcessing,
-                       QgsProcessingAlgorithm,
-                       QgsProcessingParameterRasterLayer, # For the satellite image
-                       QgsProcessingParameterFile,        # For the .pt model
-                       QgsProcessingParameterNumber,      # For Confidence threshold
-                       QgsProcessingParameterFeatureSink, # For the output points
-                       QgsFeatureSink,
-                       QgsRectangle,
-                       QgsWkbTypes,
-                       QgsSpatialIndex,
-                       QgsDistanceArea)
+from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.core import (
+    QgsFeature,
+    QgsFeatureSink,
+    QgsField,
+    QgsFields,
+    QgsGeometry,
+    QgsPointXY,
+    QgsProcessingAlgorithm,
+    QgsProcessingParameterBoolean,
+    QgsProcessingParameterFeatureSink,
+    QgsProcessingParameterFile,
+    QgsProcessingParameterNumber,
+    QgsProcessingParameterRasterLayer,
+    QgsRectangle,
+    QgsSpatialIndex,
+    QgsDistanceArea,
+    QgsWkbTypes,
+)
+
 
 
 class SawitMetricAlgorithm(QgsProcessingAlgorithm):
+    """
+    This is an example algorithm that takes a vector layer and
+    creates a new identical one.
+
+    It is meant to be used as an example of how to create your own
+    algorithms and explain methods and variables used to do it. An
+    algorithm like this will be available in all elements, and there
+    is not need for additional work.
+
+    All Processing algorithms should extend the QgsProcessingAlgorithm
+    class.
+    """
+
+    # Constants used to refer to parameters and outputs. They will be
+    # used when calling the algorithm from another algorithm, or when
+    # calling from the QGIS console.
 
     OUTPUT = 'OUTPUT'
     INPUT = 'INPUT'
@@ -52,29 +86,42 @@ class SawitMetricAlgorithm(QgsProcessingAlgorithm):
                 self.tr('Input Raster Imagery')
             )
         )
-
+ 
         # YOLOv8 Weights (.pt)
         self.addParameter(
             QgsProcessingParameterFile(
                 'MODEL_PATH',
-                self.tr('YOLOv8 Model File (.pt)'), 
+                self.tr('YOLOv8 Model File (.pt)'),
                 extension='pt'
             )
         )
-
-        # Confidence Threshold (Scientific Metric)
+ 
+        # Detection confidence — intentionally low to collect all candidates.
+        # Use Display Confidence below to filter what appears in the output.
         self.addParameter(
             QgsProcessingParameterNumber(
                 'CONFIDENCE',
-                self.tr('Confidence Threshold'),
+                self.tr('Detection Confidence Threshold (lower = more candidates)'),
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=0.1,
+                minValue=0.0,
+                maxValue=1.0
+            )
+        )
+ 
+        # Display confidence — filters the output layer without re-running inference.
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                'DISPLAY_CONF',
+                self.tr('Display Confidence Threshold (filters output layer)'),
                 type=QgsProcessingParameterNumber.Double,
                 defaultValue=0.25,
                 minValue=0.0,
                 maxValue=1.0
             )
         )
-
-        # Minimum Distance (NMS)
+ 
+        # Minimum Distance (spatial NMS)
         self.addParameter(
             QgsProcessingParameterNumber(
                 'MIN_DIST',
@@ -84,7 +131,16 @@ class SawitMetricAlgorithm(QgsProcessingAlgorithm):
                 minValue=0.0
             )
         )
-
+ 
+        # Test-Time Augmentation toggle
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                'USE_TTA',
+                self.tr('Use Test-Time Augmentation (slower, better recall)'),
+                defaultValue=False
+            )
+        )
+ 
         # Output Point Layer (Detected Trees)
         self.addParameter(
             QgsProcessingParameterFeatureSink(
@@ -93,128 +149,242 @@ class SawitMetricAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+
     def processAlgorithm(self, parameters, context, feedback):
-        raster_layer = self.parameterAsRasterLayer(parameters, self.INPUT, context)
-        model_path = self.parameterAsFile(parameters, 'MODEL_PATH', context)
+        # --- RETRIEVE PARAMETERS ---
+        raster_layer   = self.parameterAsRasterLayer(parameters, self.INPUT, context)
+        model_path     = self.parameterAsFile(parameters, 'MODEL_PATH', context)
         conf_threshold = self.parameterAsDouble(parameters, 'CONFIDENCE', context)
-        min_dist = self.parameterAsDouble(parameters, 'MIN_DIST', context)
-        
-        model = YOLO(model_path)
-        
-        # --- ADJUSTMENT: Set Target CRS to UTM (EPSG:32647) ---
-        target_crs = QgsCoordinateReferenceSystem("EPSG:32647")
-        
+        display_conf   = self.parameterAsDouble(parameters, 'DISPLAY_CONF', context)
+        min_dist       = self.parameterAsDouble(parameters, 'MIN_DIST', context)
+        use_tta        = self.parameterAsBool(parameters, 'USE_TTA', context)
+ 
+        # --- INPUT VALIDATION ---
+        if raster_layer.bandCount() < 3:
+            feedback.reportError(
+                "Input raster must have at least 3 bands (RGB). "
+                f"This layer has {raster_layer.bandCount()} band(s)."
+            )
+            return {}
+ 
+        # --- GDAL RASTER SETUP ---
+        # Open via GDAL for direct numpy access and correct dtype handling.
+        raster_path = raster_layer.source()
+        ds = gdal.Open(raster_path)
+        if ds is None:
+            feedback.reportError(f"GDAL could not open raster: {raster_path}")
+            return {}
+ 
+        # gt = (x_min, px_width, 0, y_max, 0, -px_height)
+        gt        = ds.GetGeoTransform()
+        px_size_x =  gt[1]
+        px_size_y = -gt[5]  # stored negative in geotransform
+        cols      = ds.RasterXSize
+        rows      = ds.RasterYSize
+ 
+        # Detect raster dtype to handle both 8-bit and 16-bit imagery correctly.
+        gdal_dtype = ds.GetRasterBand(1).DataType
+        is_16bit   = gdal_dtype in (gdal.GDT_UInt16, gdal.GDT_Int16)
+        if is_16bit:
+            feedback.pushInfo("16-bit raster detected. Normalizing tiles to 8-bit for inference.")
+ 
+        # --- GSD WARNING ---
+        # Approximate GSD in meters — exact for projected CRS, rough for geographic.
+        crs = raster_layer.crs()
+        if crs.isGeographic():
+            gsd_meters = px_size_x * 111_000  # degrees → meters (rough estimate)
+        else:
+            gsd_meters = px_size_x
+ 
+        if gsd_meters > 1.0:
+            feedback.pushWarning(
+                f"GSD is ~{gsd_meters:.2f} m/px. Detection quality may be reduced. "
+                f"Recommended: ≤ 0.5 m/px for oil palm."
+            )
+ 
+        # --- HARDWARE INITIALIZATION ---
+        device   = 'cuda' if torch.cuda.is_available() else 'cpu'
+        use_half = device == 'cuda'
+        feedback.pushInfo(f"Running inference on: {device.upper()}")
+        model = YOLO(model_path).to(device)
+ 
+        # --- OUTPUT LAYER SETUP ---
+        # "Filtered" field: 1 = passes display threshold, 0 = below it.
+        # All detections are written so the user can adjust the filter in QGIS
+        # without re-running inference.
         fields = QgsFields()
         fields.append(QgsField("Confidence", QVariant.Double))
-        
-        # Ensure sink uses the UTM CRS
-        (sink, dest_id) = self.parameterAsSink(parameters, self.OUTPUT,
-                context, fields, QgsWkbTypes.Point, target_crs)
-
-        provider = raster_layer.dataProvider()
-        rows = raster_layer.height()
-        cols = raster_layer.width()
-        extent = raster_layer.extent()
-        
-        px_size_x = extent.width() / cols
-        px_size_y = extent.height() / rows
-        tile_size = 640
-        
-        all_detections = [] 
-
+        fields.append(QgsField("Filtered",   QVariant.Int))
+ 
+        (sink, dest_id) = self.parameterAsSink(
+            parameters, self.OUTPUT, context, fields, QgsWkbTypes.Point, crs
+        )
+ 
+        # --- OVERLAPPING TILING ---
+        tile_size   = 640
+        overlap     = 128
+        stride      = tile_size - overlap
+        total_tiles = math.ceil(rows / stride) * math.ceil(cols / stride)
+        tile_count  = 0
+        all_detections = []
+ 
+        # Pre-compute spatial index search offset in CRS units.
+        # For geographic CRS (degrees), convert meters to a degree over-estimate.
+        # For projected CRS (meters), use min_dist directly.
+        # This only drives the spatial pre-filter; exact distance uses QgsDistanceArea.
+        if crs.isGeographic():
+            search_offset = min_dist / 111_000
+        else:
+            search_offset = min_dist
+ 
         # --- DETECTION PASS ---
-        for y in range(0, rows, tile_size):
-            for x in range(0, cols, tile_size):
-                if feedback.isCanceled(): break
-
-                window_width = min(tile_size, cols - x)
+        for y in range(0, rows, stride):
+            if feedback.isCanceled():
+                break
+ 
+            for x in range(0, cols, stride):
+                if feedback.isCanceled():
+                    break
+ 
+                tile_count += 1
+                feedback.setProgress(int(tile_count / total_tiles * 80))
+ 
+                window_width  = min(tile_size, cols - x)
                 window_height = min(tile_size, rows - y)
-                
-                tile_x_min = extent.xMinimum() + (x * px_size_x)
-                tile_y_max = extent.yMaximum() - (y * px_size_y)
-                tile_x_max = tile_x_min + (window_width * px_size_x)
-                tile_y_min = tile_y_max - (window_height * px_size_y)
-                tile_rect = QgsRectangle(tile_x_min, tile_y_min, tile_x_max, tile_y_max)
-
-                img_np = np.zeros((window_height, window_width, 3), dtype=np.uint8)
-                for band in range(1, 4):
-                    block = provider.block(band, tile_rect, window_width, window_height)
-                    ptr = block.data()
-                    line_array = np.frombuffer(ptr, dtype=np.uint8).reshape((window_height, window_width))
-                    img_np[:, :, band-1] = line_array
-
-                results = model.predict(source=img_np, conf=conf_threshold, save=False)
-                
+ 
+                # Always allocate a full (tile_size, tile_size) canvas.
+                # Edge tiles are zero-padded so YOLO sees a consistent input scale.
+                img_np = np.zeros((tile_size, tile_size, 3), dtype=np.uint8)
+ 
+                for band_idx in range(3):
+                    band_data = ds.GetRasterBand(band_idx + 1).ReadAsArray(
+                        x, y, window_width, window_height
+                    )
+                    if is_16bit:
+                        # Normalize per-tile to preserve local contrast.
+                        b_min = band_data.min()
+                        b_max = band_data.max()
+                        if b_max > b_min:
+                            band_data = (band_data - b_min) / (b_max - b_min) * 255
+                        else:
+                            band_data = np.zeros_like(band_data)
+                        band_data = band_data.astype(np.uint8)
+ 
+                    img_np[:window_height, :window_width, band_idx] = band_data
+ 
+                results = model.predict(
+                    source=img_np,
+                    conf=conf_threshold,
+                    device=device,
+                    half=use_half,
+                    augment=use_tta,
+                    verbose=False
+                )
+ 
+                # Map pixel coordinates back to map coordinates using geotransform.
                 for r in results:
                     for box in r.boxes:
-                        coords = box.xywh[0]
+                        coords  = box.xywh[0]
                         pixel_x = x + coords[0].item()
                         pixel_y = y + coords[1].item()
-                        
-                        map_x = extent.xMinimum() + (pixel_x * px_size_x)
-                        map_y = extent.yMaximum() - (pixel_y * px_size_y)
-                        
+ 
+                        map_x = gt[0] + (pixel_x * px_size_x)
+                        map_y = gt[3] - (pixel_y * px_size_y)
+ 
                         all_detections.append({
                             'point': QgsPointXY(map_x, map_y),
-                            'conf': float(box.conf[0])
+                            'conf':  float(box.conf[0])
                         })
-
-        # --- ADJUSTMENT: Optimized NMS for UTM (Meters) ---
-        feedback.pushInfo(f"Filtering {len(all_detections)} detections in UTM Meters...")
-        all_detections.sort(key=lambda x: x['conf'], reverse=True)
-        
-        spatial_index = QgsSpatialIndex()
-        final_points = []
-        
-        # Search window is now in meters. 10m is a safe radius for palm spacing.
-        search_window = 10.0
-
-        for i, det in enumerate(all_detections):
+ 
+        ds = None  # Close GDAL dataset
+ 
+        # --- SPATIAL NMS ---
+        feedback.pushInfo(f"Running NMS on {len(all_detections)} raw detections...")
+        all_detections.sort(key=lambda d: d['conf'], reverse=True)
+ 
+        # QgsDistanceArea gives correct meter distances regardless of CRS.
+        da = QgsDistanceArea()
+        da.setSourceCrs(crs, context.transformContext())
+        da.setEllipsoid('WGS84')
+ 
+        spatial_index    = QgsSpatialIndex()
+        kept_id_to_point = {}  # feature ID → QgsPointXY, for kept detections only
+        final_points     = []
+ 
+        for det in all_detections:
+            pt = det['point']
             search_rect = QgsRectangle(
-                det['point'].x() - search_window, det['point'].y() - search_window,
-                det['point'].x() + search_window, det['point'].y() + search_window
+                pt.x() - search_offset, pt.y() - search_offset,
+                pt.x() + search_offset, pt.y() + search_offset
             )
-            
-            potential_neighbor_ids = spatial_index.intersects(search_rect)
-            
+ 
             keep = True
-            for n_idx in potential_neighbor_ids:
-                neighbor_pt = all_detections[n_idx]['point']
-                # Direct distance calculation (accurate in UTM)
-                dist_m = det['point'].distance(neighbor_pt)
-                
-                if dist_m < min_dist:
+            for n_idx in spatial_index.intersects(search_rect):
+                if da.measureLine(pt, kept_id_to_point[n_idx]) < min_dist:
                     keep = False
                     break
-            
+ 
             if keep:
+                new_id = len(final_points)
                 final_points.append(det)
+                kept_id_to_point[new_id] = pt
+ 
                 f = QgsFeature()
-                f.setGeometry(QgsGeometry.fromPointXY(det['point']))
-                f.setId(i)
+                f.setGeometry(QgsGeometry.fromPointXY(pt))
+                f.setId(new_id)
                 spatial_index.addFeature(f)
-
-        # Write final results
+ 
+        # --- OUTPUT SINK ---
+        passed_display = sum(1 for p in final_points if p['conf'] >= display_conf)
+        feedback.pushInfo(
+            f"NMS complete. Kept {len(final_points)} trees total "
+            f"({passed_display} pass the display threshold of {display_conf})."
+        )
+ 
         for p in final_points:
             feat = QgsFeature(fields)
             feat.setGeometry(QgsGeometry.fromPointXY(p['point']))
             feat.setAttribute("Confidence", p['conf'])
+            feat.setAttribute("Filtered",   1 if p['conf'] >= display_conf else 0)
             sink.addFeature(feat, QgsFeatureSink.FastInsert)
-
-        feedback.pushInfo(f"NMS Complete. Kept {len(final_points)} trees.")
+ 
+        feedback.setProgress(100)
         return {self.OUTPUT: dest_id}
+
     
     def name(self):
-        return 'Detect and Count Palm Trees'
+        """
+        Returns the algorithm name, used for identifying the algorithm. This
+        string should be fixed for the algorithm, and must not be localised.
+        The name should be unique within each provider. Names should contain
+        lowercase alphanumeric characters only and no spaces or other
+        formatting characters.
+        """
+        return 'detectandcountpalmtrees'
 
     def displayName(self):
-        return self.tr(self.name())
+        """
+        Returns the translated algorithm name, which should be used for any
+        user-visible display of the algorithm name.
+        """
+        return self.tr('Detect and Count Palm Trees')
 
     def group(self):
+        """
+        Returns the name of the group this algorithm belongs to. This string
+        should be localised.
+        """
         return self.tr(self.groupId())
 
     def groupId(self):
-        return 'Inventory Tools'
+        """
+        Returns the unique ID of the group this algorithm belongs to. This
+        string should be fixed for the algorithm, and must not be localised.
+        The group id should be unique within each provider. Group id should
+        contain lowercase alphanumeric characters only and no spaces or other
+        formatting characters.
+        """
+        return 'inventorytools'
 
     def tr(self, string):
         return QCoreApplication.translate('Processing', string)
